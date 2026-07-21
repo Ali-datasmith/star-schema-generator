@@ -6,6 +6,16 @@ st.tabs() call; tabs are pure renderers over st.session_state.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Force the repository root directory into Python's search path.
+# Streamlit Community Cloud runs this file with `app/` as the CWD, so the
+# top-level `app` package is invisible unless we explicitly inject its parent.
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import datetime as dt
 import json
 
