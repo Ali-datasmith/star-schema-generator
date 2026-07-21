@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.streamlit/secrets.toml
+*.duckdb
+*.db
+.ipynb_checkpoints/
+.config/
+sample_data/
+.DS_Store
