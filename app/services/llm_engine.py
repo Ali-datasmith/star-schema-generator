@@ -21,8 +21,8 @@ from app.schemas import StarSchemaResponse
 # Configure logger for this module
 logger = logging.getLogger(__name__)
 
-# Hardcoded model chain as requested
-MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
+# Hardcoded model chain using actual, available FREE TIER Google AI models
+MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
 
 class SchemaGenerationError(Exception):
@@ -177,8 +177,7 @@ class StarSchemaGenerator:
                 try:
                     validated = StarSchemaResponse.model_validate_json(response.text)
                 except Exception as val_exc:
-                    # If a model outputs invalid JSON structure, we can optionally fallback 
-                    # to see if the next model performs better.
+                    # If a model outputs invalid JSON structure, fallback to see if the next model performs better.
                     logger.warning(f"Model {model} produced structurally invalid JSON. Triggering fallback. Error: {val_exc}")
                     last_exception = SchemaValidationError(
                         f"LLM output failed StarSchemaResponse validation: {val_exc}\n"
