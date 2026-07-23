@@ -1,16 +1,41 @@
 """
 schemas.py
 Pydantic v2 data contracts for the Data Warehouse Star-Schema Generator.
-All models are fully typed and JSON-schema exportable via model_json_schema()
-for use as the `response_schema` passed to the Gemini structured output API.
+
+IMPORTANT — Gemini structured-output compatibility:
+Gemini's `response_schema` only accepts a restricted subset of JSON Schema
+(roughly: type, format, description, enum, properties, required, items,
+nullable, minItems/maxItems, additionalProperties). Keywords Pydantic v2
+happily emits from `pattern=` and `min_length=` on `str` fields — i.e.
+`"pattern"` and `"minLength"` — are NOT reliably accepted by every Gemini
+model/endpoint. Sending them produces a 400 INVALID_ARGUMENT ("bad schema")
+before the model ever runs. This was the root cause of Project B's 400s.
+
+Fix: string-level `pattern` / `min_length` constraints have been removed
+from every `Field(...)` that participates in `response_schema`. The exact
+same rules (dim_ prefix, lower_snake_case, non-empty) are now enforced by
+`@field_validator` / `@model_validator`, which run locally *after*
+Pydantic has already parsed the model's JSON — they never get serialized
+into the schema sent to the API, so they cost nothing on the wire and
+still reject a malformed response before it reaches the UI.
+
+List-level `min_length` (which maps to the widely-supported `minItems`)
+is left in place.
+
+All models are strict (`extra="forbid"`), fully typed, and JSON-schema
+exportable via model_json_schema(). No legacy Pydantic v1 methods
+(.dict(), .json(), schema()) are used anywhere in this codebase.
 """
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+_SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class DuckDBDataType(str, Enum):
@@ -35,14 +60,11 @@ class MeasureType(str, Enum):
 
 class DimensionColumn(BaseModel):
     """A single attribute column on a dimension table."""
-    # Changed from "forbid" to "ignore" to prevent Gemini API 400 INVALID_ARGUMENT errors
-    # caused by Pydantic emitting "additionalProperties": false in the JSON schema.
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     name: str = Field(
         ...,
-        min_length=1,
-        description="Column name in lower_snake_case.",
+        description="Column name in lower_snake_case, e.g. 'customer_email'.",
     )
     data_type: DuckDBDataType = Field(
         ...,
@@ -58,31 +80,34 @@ class DimensionColumn(BaseModel):
     )
     description: str = Field(
         ...,
-        min_length=1,
         description="Human-readable description of the column's business meaning.",
     )
 
     @field_validator("name")
     @classmethod
     def validate_snake_case(cls, v: str) -> str:
-        if not v.replace("_", "").isalnum() or v != v.lower():
-            raise ValueError(f"Column name '{v}' must be lower_snake_case.")
+        if not v or not _SNAKE_CASE_RE.match(v):
+            raise ValueError(f"Column name '{v}' must be non-empty lower_snake_case.")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def validate_description_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Column description must not be empty.")
         return v
 
 
 class DimensionTable(BaseModel):
     """A single dimension table, e.g. dim_customer."""
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     table_name: str = Field(
         ...,
-        min_length=1,
-        pattern=r"^dim_[a-z0-9_]+$",
-        description="Dimension table name, must be prefixed with 'dim_'.",
+        description="Dimension table name, must be prefixed with 'dim_', e.g. 'dim_customer'.",
     )
     surrogate_key_name: str = Field(
         ...,
-        min_length=1,
         description="Name of the surrogate key column, e.g. 'customer_sk'.",
     )
     attributes: List[DimensionColumn] = Field(
@@ -90,6 +115,20 @@ class DimensionTable(BaseModel):
         min_length=1,
         description="Ordered list of dimension attribute columns, including the surrogate key column.",
     )
+
+    @field_validator("table_name")
+    @classmethod
+    def validate_dim_prefix(cls, v: str) -> str:
+        if not v.startswith("dim_") or not _SNAKE_CASE_RE.match(v):
+            raise ValueError(f"DimensionTable.table_name '{v}' must match 'dim_[a-z0-9_]+'.")
+        return v
+
+    @field_validator("surrogate_key_name")
+    @classmethod
+    def validate_sk_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("surrogate_key_name must not be empty.")
+        return v
 
     @model_validator(mode="after")
     def validate_surrogate_key_present(self) -> "DimensionTable":
@@ -109,9 +148,9 @@ class DimensionTable(BaseModel):
 
 class FactColumn(BaseModel):
     """A single column on a fact table — key or measure."""
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
-    name: str = Field(..., min_length=1, description="Column name in lower_snake_case.")
+    name: str = Field(..., description="Column name in lower_snake_case.")
     data_type: DuckDBDataType = Field(..., description="DuckDB-native SQL data type.")
     is_primary_key: bool = Field(
         default=False,
@@ -130,6 +169,13 @@ class FactColumn(BaseModel):
         description="Additive classification of the measure; 'none' for key columns.",
     )
 
+    @field_validator("name")
+    @classmethod
+    def validate_snake_case(cls, v: str) -> str:
+        if not v or not _SNAKE_CASE_RE.match(v):
+            raise ValueError(f"FactColumn name '{v}' must be non-empty lower_snake_case.")
+        return v
+
     @model_validator(mode="after")
     def validate_fk_reference(self) -> "FactColumn":
         if self.is_foreign_key and not self.references_table:
@@ -145,17 +191,14 @@ class FactColumn(BaseModel):
 
 class FactTable(BaseModel):
     """The single generated fact table, e.g. fct_orders."""
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     table_name: str = Field(
         ...,
-        min_length=1,
-        pattern=r"^fct_[a-z0-9_]+$",
-        description="Fact table name, must be prefixed with 'fct_'.",
+        description="Fact table name, must be prefixed with 'fct_', e.g. 'fct_orders'.",
     )
     primary_key: str = Field(
         ...,
-        min_length=1,
         description="Name of the fact table's primary key column.",
     )
     foreign_keys: List[str] = Field(
@@ -169,9 +212,22 @@ class FactTable(BaseModel):
     )
     ddl_sql: str = Field(
         ...,
-        min_length=1,
         description="Fully-formed CREATE TABLE DDL statement for this fact table.",
     )
+
+    @field_validator("table_name")
+    @classmethod
+    def validate_fct_prefix(cls, v: str) -> str:
+        if not v.startswith("fct_") or not _SNAKE_CASE_RE.match(v):
+            raise ValueError(f"FactTable.table_name '{v}' must match 'fct_[a-z0-9_]+'.")
+        return v
+
+    @field_validator("primary_key", "ddl_sql")
+    @classmethod
+    def validate_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field must not be empty.")
+        return v
 
     @model_validator(mode="after")
     def validate_foreign_keys_present(self) -> "FactTable":
@@ -186,28 +242,39 @@ class FactTable(BaseModel):
 
 class DbtSqlFile(BaseModel):
     """A single generated dbt SQL file."""
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     filename: str = Field(
         ...,
-        min_length=1,
         description="File name including extension, e.g. 'stg_stripe_orders.sql'.",
     )
     model_type: str = Field(
         ...,
-        pattern=r"^(staging|dimension|fact)$",
         description="Category of dbt model: 'staging', 'dimension', or 'fact'.",
     )
     content: str = Field(
         ...,
-        min_length=1,
         description="Full Jinja + SQL file content, copy-pasteable into a dbt project.",
     )
+
+    @field_validator("filename", "content")
+    @classmethod
+    def validate_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field must not be empty.")
+        return v
+
+    @field_validator("model_type")
+    @classmethod
+    def validate_model_type(cls, v: str) -> str:
+        if v not in {"staging", "dimension", "fact"}:
+            raise ValueError(f"model_type '{v}' must be one of staging/dimension/fact.")
+        return v
 
 
 class DbtModelBundle(BaseModel):
     """All dbt Core artifacts required to materialize the star schema."""
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     staging_models: List[DbtSqlFile] = Field(
         ...,
@@ -221,14 +288,20 @@ class DbtModelBundle(BaseModel):
     )
     schema_yml: str = Field(
         ...,
-        min_length=1,
         description="Full contents of schema.yml declaring sources, models, columns, and tests.",
     )
+
+    @field_validator("schema_yml")
+    @classmethod
+    def validate_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("schema_yml must not be empty.")
+        return v
 
 
 class StarSchemaResponse(BaseModel):
     """Root response model returned by the LLM and validated end-to-end."""
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     fact_table: FactTable = Field(..., description="The single generated fact table.")
     dimensions: List[DimensionTable] = Field(
@@ -238,7 +311,6 @@ class StarSchemaResponse(BaseModel):
     )
     duckdb_ddl: str = Field(
         ...,
-        min_length=1,
         description=(
             "Concatenated, executable DuckDB DDL script for the full star schema "
             "(CREATE SEQUENCE statements, CREATE TABLE statements, foreign keys)."
@@ -248,6 +320,13 @@ class StarSchemaResponse(BaseModel):
         ...,
         description="Generated dbt Core staging and mart models plus schema.yml.",
     )
+
+    @field_validator("duckdb_ddl")
+    @classmethod
+    def validate_ddl_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("duckdb_ddl must not be empty.")
+        return v
 
     @model_validator(mode="after")
     def validate_fk_targets_exist(self) -> "StarSchemaResponse":
