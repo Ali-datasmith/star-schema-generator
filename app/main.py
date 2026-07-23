@@ -17,14 +17,12 @@ from pathlib import Path
 # repository root. CPython then prepends the script's *own* directory
 # (`<repo>/app`) to sys.path[0], not the repository root. Without this
 # injection, `from app.schemas import ...` resolves to `<repo>/app/app/...`
-# and raises ModuleNotFoundError. We also honour PYTHONPATH for local runs.
+# and raises ModuleNotFoundError.
 # ---------------------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
 _ROOT_STR = str(ROOT_DIR)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-# Belt-and-suspenders: also expose via PYTHONPATH so subprocesses (e.g. DuckDB
-# worker threads) inherit the same search path.
 os.environ.setdefault("PYTHONPATH", _ROOT_STR)
 
 import datetime as dt
@@ -57,14 +55,13 @@ st.set_page_config(
 inject_glassmorphism_css()
 
 # ---------------------------------------------------------------------------
-# Session-state initialization — runs BEFORE any consumer (incl. TelemetryConsole)
+# Session-state initialization
 # ---------------------------------------------------------------------------
 DEFAULTS = {
     "research_active": False,
     "pipeline_stage": "idle",
     "raw_json_input": "",
     "api_key": "",
-    "selected_model": "gemini-2.5-flash",
     "schema_result": None,
     "llm_call_result": None,
     "ddl_execution_report": None,
@@ -76,10 +73,9 @@ for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-# TelemetryConsole can now safely read st.session_state.telemetry_log.
 console = TelemetryConsole()
 
-# Sample payloads (unchanged)
+# Sample payloads
 SAMPLE_STRIPE_PAYLOAD = """{
   "id": "evt_1OqZxR2eZvKYlo2C0JqZvK",
   "object": "event",
@@ -148,7 +144,7 @@ def render_sidebar() -> bool:
     with st.sidebar:
         st.markdown("### Configuration")
 
-        # Defensive secret access — st.secrets may be empty on first deploy.
+        # Defensive secret access
         try:
             secret_key: str = st.secrets.get("GOOGLE_API_KEY", "") or ""
         except (KeyError, AttributeError):
@@ -161,11 +157,8 @@ def render_sidebar() -> bool:
             help="Falls back to st.secrets['GOOGLE_API_KEY'] if left blank.",
         )
 
-        st.session_state.selected_model = st.selectbox(
-            "Gemini model",
-            options=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
-            index=0,
-        )
+        # Static Model Engine Status Display (Replaces dropdown selector)
+        st.info("⚡ Model Engine: Gemini 3.5 Flash (Auto-fallback: 2.5 Flash)")
 
         sample = st.selectbox(
             "Sample payload",
@@ -210,11 +203,8 @@ def run_pipeline() -> None:
 
         # ---- Call LLM ----
         st.session_state.pipeline_stage = "calling_llm"
-        with st.spinner(f"Calling {st.session_state.selected_model} for schema design..."):
-            generator = StarSchemaGenerator(
-                api_key=st.session_state.api_key,
-                model=st.session_state.selected_model,
-            )
+        with st.spinner("Calling Gemini 3.5 Flash for schema design..."):
+            generator = StarSchemaGenerator(api_key=st.session_state.api_key)
             call_result = generator.generate(st.session_state.raw_json_input)
             st.session_state.llm_call_result = call_result
             console.log_llm_call(call_result)
@@ -268,7 +258,7 @@ st.markdown(
         <h1>Data Warehouse Star-Schema Generator</h1>
         <p>Raw JSON &rarr; Pydantic-validated dimensional model &rarr; DuckDB DDL &rarr; dbt Core</p>
         <p style="margin-top: 0.5rem; font-size: 0.85rem; color: #A9C2C0;">
-            Built with Python 3.10+, Pydantic v2, Gemini 2.5, DuckDB, and Streamlit
+            Built with Python 3.10+, Pydantic v2, Gemini 3.5 Flash, DuckDB, and Streamlit
         </p>
     </div>
     """,
