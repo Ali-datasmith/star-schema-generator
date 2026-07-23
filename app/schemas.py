@@ -1,10 +1,8 @@
 """
 schemas.py
 Pydantic v2 data contracts for the Data Warehouse Star-Schema Generator.
-All models are strict (`extra="forbid"`), fully typed, and JSON-schema exportable via
-model_json_schema() for use as the `response_schema` passed to the Gemini structured
-output API. No legacy Pydantic v1 methods (.dict(), .json(), schema()) are used anywhere
-in this codebase.
+All models are fully typed and JSON-schema exportable via model_json_schema()
+for use as the `response_schema` passed to the Gemini structured output API.
 """
 
 from __future__ import annotations
@@ -37,7 +35,9 @@ class MeasureType(str, Enum):
 
 class DimensionColumn(BaseModel):
     """A single attribute column on a dimension table."""
-    model_config = {"extra": "forbid"}
+    # Changed from "forbid" to "ignore" to prevent Gemini API 400 INVALID_ARGUMENT errors
+    # caused by Pydantic emitting "additionalProperties": false in the JSON schema.
+    model_config = {"extra": "ignore"}
 
     name: str = Field(
         ...,
@@ -72,7 +72,7 @@ class DimensionColumn(BaseModel):
 
 class DimensionTable(BaseModel):
     """A single dimension table, e.g. dim_customer."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     table_name: str = Field(
         ...,
@@ -109,7 +109,7 @@ class DimensionTable(BaseModel):
 
 class FactColumn(BaseModel):
     """A single column on a fact table — key or measure."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     name: str = Field(..., min_length=1, description="Column name in lower_snake_case.")
     data_type: DuckDBDataType = Field(..., description="DuckDB-native SQL data type.")
@@ -145,7 +145,7 @@ class FactColumn(BaseModel):
 
 class FactTable(BaseModel):
     """The single generated fact table, e.g. fct_orders."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     table_name: str = Field(
         ...,
@@ -186,7 +186,7 @@ class FactTable(BaseModel):
 
 class DbtSqlFile(BaseModel):
     """A single generated dbt SQL file."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     filename: str = Field(
         ...,
@@ -207,7 +207,7 @@ class DbtSqlFile(BaseModel):
 
 class DbtModelBundle(BaseModel):
     """All dbt Core artifacts required to materialize the star schema."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     staging_models: List[DbtSqlFile] = Field(
         ...,
@@ -228,7 +228,7 @@ class DbtModelBundle(BaseModel):
 
 class StarSchemaResponse(BaseModel):
     """Root response model returned by the LLM and validated end-to-end."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     fact_table: FactTable = Field(..., description="The single generated fact table.")
     dimensions: List[DimensionTable] = Field(
