@@ -9,7 +9,7 @@ Tab 4, so the console output and the UI stay in lock-step.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 from rich.console import Console
@@ -24,6 +24,8 @@ class TelemetryConsole:
 
     def __init__(self) -> None:
         self._console = Console()
+        # Do NOT initialise session_state here — main.py owns DEFAULTS now.
+        # Only ensure the key exists defensively.
         if "telemetry_log" not in st.session_state:
             st.session_state.telemetry_log = []
 
@@ -35,7 +37,9 @@ class TelemetryConsole:
         }
         st.session_state.telemetry_log.append(entry)
 
-    def log_json_validation(self, duration_seconds: float, is_valid: bool, error: str | None = None) -> None:
+    def log_json_validation(
+        self, duration_seconds: float, is_valid: bool, error: Optional[str] = None
+    ) -> None:
         table = Table(title="JSON Payload Validation", show_header=True, header_style="bold #3C9992")
         table.add_column("Metric")
         table.add_column("Value")
@@ -95,4 +99,4 @@ class TelemetryConsole:
         )
 
     def get_log(self) -> List[Dict[str, Any]]:
-        return st.session_state.telemetry_log
+        return list(st.session_state.telemetry_log)
