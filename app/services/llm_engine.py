@@ -10,11 +10,9 @@ from __future__ import annotations
 import time
 import logging
 from dataclasses import dataclass
-from typing import Type, TypeVar
 
 from google import genai
 from google.genai import types as genai_types
-import pydantic
 
 from app.schemas import StarSchemaResponse
 
@@ -31,9 +29,6 @@ class SchemaGenerationError(Exception):
 
 class SchemaValidationError(Exception):
     """Raised when the LLM response cannot be validated against StarSchemaResponse."""
-
-
-T = TypeVar("T", bound=pydantic.BaseModel)
 
 
 SYSTEM_INSTRUCTION = """You are a senior data warehouse architect. Given a raw JSON payload \
@@ -58,74 +53,6 @@ class LLMCallResult:
     model_used: str
 
 
-def _pydantic_to_gemini_schema(model_cls: Type[pydantic.BaseModel]) -> dict:
-    """
-    Convert a Pydantic v2 model class to a Gemini-compatible JSON Schema dict.
-
-    Gemini's `response_schema` natively accepts a strict subset of JSON Schema. 
-    Pydantic v2 emits `$defs`/`$ref` pointers, `additionalProperties` (or `additional_properties`), 
-    `anyOf`, and other validation constraints that the Gemini API rejects with a 400 INVALID_ARGUMENT error.
-    We recursively flatten `$ref`s, extract types from `anyOf` (Optionals), and strictly 
-    allowlist only the fields Gemini understands.
-    """
-    raw = model_cls.model_json_schema()
-    defs = raw.pop("$defs", {})
-
-    # Strict allowlist of JSON Schema keys supported by Gemini's protobuf mapping
-    # This implicitly drops "additionalProperties" and "additional_properties"
-    ALLOWED_KEYS = {
-        "type", "format", "description", "nullable", "enum",
-        "maxItems", "minItems", "properties", "items", "required",
-        "minimum", "maximum",
-    }
-
-    def _resolve(node):
-        if not isinstance(node, dict):
-            return node
-        
-        # 1. Inline $ref recursively
-        if "$ref" in node:
-            ref_name = node["$ref"].split("/")[-1]
-            return _resolve({**defs[ref_name], **{k: v for k, v in node.items() if k != "$ref"}})
-        
-        # 2. Handle Optional fields (anyOf)
-        if "anyOf" in node:
-            non_null = next((s for s in node["anyOf"] if s.get("type") != "null"), node["anyOf"][0])
-            resolved = _resolve(non_null)
-            resolved["nullable"] = True
-            return resolved
-
-        # 3. Recurse and allowlist keys
-        cleaned: dict = {}
-        for k, v in node.items():
-            if k not in ALLOWED_KEYS:
-                continue
-            
-            if k == "type" and isinstance(v, list):
-                # Pydantic emits ["string", "null"] for Optional[str] sometimes.
-                cleaned["type"] = next(t for t in v if t != "null")
-                cleaned["nullable"] = True
-                continue
-            
-            if k == "properties":
-                cleaned["properties"] = {pk: _resolve(pv) for pk, pv in v.items()}
-                continue
-                
-            if k == "items":
-                cleaned["items"] = _resolve(v)
-                continue
-                
-            if k == "enum":
-                cleaned["enum"] = list(v)
-                continue
-                
-            cleaned[k] = _resolve(v)
-            
-        return cleaned
-
-    return _resolve(raw)
-
-
 class StarSchemaGenerator:
     """Thin, testable wrapper around genai.Client() for structured star-schema generation."""
 
@@ -140,7 +67,6 @@ class StarSchemaGenerator:
 
     def generate(self, raw_json_payload: str) -> LLMCallResult:
         start = time.perf_counter()
-        schema = _pydantic_to_gemini_schema(StarSchemaResponse)
         
         last_exception = None
         
@@ -161,7 +87,9 @@ class StarSchemaGenerator:
                     config=genai_types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
                         response_mime_type="application/json",
-                        response_schema=schema,
+                        # SDK natively supports Pydantic classes. 
+                        # This prevents 400 INVALID_ARGUMENT errors caused by manual JSON schema dict flattening.
+                        response_schema=StarSchemaResponse,
                         temperature=0.1,
                         max_output_tokens=8192,
                     ),
