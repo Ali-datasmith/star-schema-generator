@@ -22,8 +22,7 @@ from app.schemas import StarSchemaResponse
 logger = logging.getLogger(__name__)
 
 # Hardcoded model chain as requested
-PRIMARY_MODEL = "gemini-3.5-flash"
-FALLBACK_MODEL = "gemini-2.5-flash"
+MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
 
 
 class SchemaGenerationError(Exception):
@@ -73,6 +72,7 @@ def _pydantic_to_gemini_schema(model_cls: Type[pydantic.BaseModel]) -> dict:
     defs = raw.pop("$defs", {})
 
     # Strict allowlist of JSON Schema keys supported by Gemini's protobuf mapping
+    # This implicitly drops "additionalProperties" and "additional_properties"
     ALLOWED_KEYS = {
         "type", "format", "description", "nullable", "enum",
         "maxItems", "minItems", "properties", "items", "required",
@@ -95,13 +95,14 @@ def _pydantic_to_gemini_schema(model_cls: Type[pydantic.BaseModel]) -> dict:
             resolved["nullable"] = True
             return resolved
 
-        # 3. Recurse and allowlist keys (this implicitly drops additionalProperties)
+        # 3. Recurse and allowlist keys
         cleaned: dict = {}
         for k, v in node.items():
             if k not in ALLOWED_KEYS:
                 continue
             
             if k == "type" and isinstance(v, list):
+                # Pydantic emits ["string", "null"] for Optional[str] sometimes.
                 cleaned["type"] = next(t for t in v if t != "null")
                 cleaned["nullable"] = True
                 continue
@@ -135,14 +136,21 @@ class StarSchemaGenerator:
                 "Set st.secrets['GOOGLE_API_KEY'] or enter it in the sidebar."
             )
         self._client = genai.Client(api_key=api_key)
-        self._model_chain = [PRIMARY_MODEL, FALLBACK_MODEL]
+        self._model_chain = MODELS
 
-    def _attempt_generate(self, model: str, raw_json_payload: str, schema: dict) -> genai_types.GenerateContentResponse:
-        """Single generation attempt with exponential backoff for transient 429s."""
-        max_retries = 3
-        for attempt in range(max_retries):
+    def generate(self, raw_json_payload: str) -> LLMCallResult:
+        start = time.perf_counter()
+        schema = _pydantic_to_gemini_schema(StarSchemaResponse)
+        
+        last_exception = None
+        
+        # Iterate through the model fallback chain
+        for model in self._model_chain:
             try:
-                return self._client.models.generate_content(
+                logger.info(f"Attempting generation with model: {model}")
+                
+                # Single attempt generation (no internal retry loops)
+                response = self._client.models.generate_content(
                     model=model,
                     contents=[
                         genai_types.Content(
@@ -158,37 +166,30 @@ class StarSchemaGenerator:
                         max_output_tokens=8192,
                     ),
                 )
-            except Exception as exc:
-                error_str = str(exc)
-                # Retry only on standard rate limits (429 without limit: 0)
-                if "429" in error_str and "limit: 0" not in error_str and attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) + 1
-                    time.sleep(wait_time)
-                    continue
-                raise
-
-    def generate(self, raw_json_payload: str) -> LLMCallResult:
-        start = time.perf_counter()
-        schema = _pydantic_to_gemini_schema(StarSchemaResponse)
-        
-        last_exception = None
-        for model in self._model_chain:
-            try:
-                response = self._attempt_generate(model, raw_json_payload, schema)
-                latency = time.perf_counter() - start
-
+                
+                # Check for empty response body
                 if response.text is None or response.text.strip() == "":
-                    raise SchemaGenerationError("Gemini returned an empty response body.")
+                    logger.warning(f"Model {model} returned an empty response body. Triggering fallback.")
+                    last_exception = SchemaGenerationError("Gemini returned an empty response body.")
+                    continue
 
+                # Attempt Pydantic validation
                 try:
                     validated = StarSchemaResponse.model_validate_json(response.text)
-                except Exception as exc:
-                    raise SchemaValidationError(
-                        f"LLM output failed StarSchemaResponse validation: {exc}\n"
+                except Exception as val_exc:
+                    # If a model outputs invalid JSON structure, we can optionally fallback 
+                    # to see if the next model performs better.
+                    logger.warning(f"Model {model} produced structurally invalid JSON. Triggering fallback. Error: {val_exc}")
+                    last_exception = SchemaValidationError(
+                        f"LLM output failed StarSchemaResponse validation: {val_exc}\n"
                         f"Raw output (first 2000 chars): {response.text[:2000]}"
-                    ) from exc
+                    )
+                    continue
 
+                # Success! Calculate metrics and return
+                latency = time.perf_counter() - start
                 usage = response.usage_metadata
+                
                 return LLMCallResult(
                     response=validated,
                     raw_text=response.text,
@@ -198,23 +199,14 @@ class StarSchemaGenerator:
                     model_used=model
                 )
 
-            except SchemaValidationError:
-                # If JSON is returned but fails Pydantic validation, do not fallback.
-                raise
             except Exception as exc:
+                # BROAD CATCH: Catches 503 UNAVAILABLE, 429 RESOURCE_EXHAUSTED, 404 NOT_FOUND, 
+                # APIError, ServerError, ClientError, and all other exceptions.
+                logger.warning(f"Model {model} failed with API error: {str(exc)}. Attempting fallback model...")
                 last_exception = exc
-                error_str = str(exc)
-                
-                # Trigger fallback for 404, 429, or quota issues
-                if "404" in error_str or "429" in error_str or "quota" in error_str.lower():
-                    logger.warning(
-                        f"Model {model} failed with API error. Falling back to next model. Error: {error_str}"
-                    )
-                    continue
-                # For other errors (400 bad request, 401 auth), raise immediately
-                raise SchemaGenerationError(f"Gemini API call failed for {model}: {exc}") from exc
+                continue
 
-        # Exhausted the fallback chain
+        # If the loop completes without returning, all models have failed
         raise SchemaGenerationError(
-            f"All models in the chain failed. Last error from {self._model_chain[-1]}: {last_exception}"
+            f"All models in the fallback chain failed. Last recorded error: {last_exception}"
         ) from last_exception
