@@ -2,6 +2,14 @@
 main.py
 Top-level Streamlit entrypoint. All backend mutation happens above the
 st.tabs() call; tabs are pure renderers over st.session_state.
+
+Execution lifecycle mirrors Project A's proven "single-path guard" pattern:
+a button click only ever sets `research_active = True` and calls
+`st.rerun()`; the actual network/DDL work happens on the *next* run, behind
+`if st.session_state.research_active:`. This guarantees exactly one
+in-flight pipeline run at a time even across Streamlit's rerun-on-widget-
+interaction model, and keeps the spinner/status UI in a full, clean render
+pass rather than partway through a synchronous button-click handler.
 """
 
 from __future__ import annotations
@@ -30,9 +38,9 @@ import json
 
 import streamlit as st
 
-from app.schemas import StarSchemaResponse
 from app.services.duckdb_runner import DDLExecutionError, DuckDBSandboxRunner
 from app.services.llm_engine import (
+    DEFAULT_MODELS,
     SchemaGenerationError,
     SchemaValidationError,
     StarSchemaGenerator,
@@ -55,7 +63,7 @@ st.set_page_config(
 inject_glassmorphism_css()
 
 # ---------------------------------------------------------------------------
-# Session-state initialization
+# Session-state initialization — must happen before any widget renders.
 # ---------------------------------------------------------------------------
 DEFAULTS = {
     "research_active": False,
@@ -74,6 +82,19 @@ for key, value in DEFAULTS.items():
         st.session_state[key] = value
 
 console = TelemetryConsole()
+
+# Model chain actually used for generation. Resolvable via st.secrets /
+# env so the displayed model and the executed model can never drift again.
+try:
+    _configured_models = st.secrets.get("GEMINI_MODELS", "")
+except (KeyError, AttributeError):
+    _configured_models = ""
+_configured_models = _configured_models or os.environ.get("GEMINI_MODELS", "")
+MODEL_CHAIN = (
+    [m.strip() for m in _configured_models.split(",") if m.strip()]
+    if _configured_models
+    else DEFAULT_MODELS
+)
 
 # Sample payloads
 SAMPLE_STRIPE_PAYLOAD = """{
@@ -157,8 +178,9 @@ def render_sidebar() -> bool:
             help="Falls back to st.secrets['GOOGLE_API_KEY'] if left blank.",
         )
 
-        # Static Model Engine Status Display (Replaces dropdown selector)
-        st.info("⚡ Model Engine: Gemini 3.5 Flash (Auto-fallback: 2.5 Flash)")
+        # Model chain display now reflects the chain actually executed —
+        # no more drift between the label and MODELS in llm_engine.py.
+        st.info(f"⚡ Model chain: {' → '.join(MODEL_CHAIN)}")
 
         sample = st.selectbox(
             "Sample payload",
@@ -178,22 +200,25 @@ def render_sidebar() -> bool:
         generate_clicked = st.button(
             "Generate Star-Schema",
             type="primary",
-            disabled=st.session_state.pipeline_stage
-            in {"validating_json", "calling_llm", "executing_ddl"},
+            disabled=st.session_state.research_active,
             use_container_width=True,
         )
     return generate_clicked
 
 
-def run_pipeline() -> None:
-    """Single-path orchestration: LLM call -> validation -> DuckDB execution."""
-    st.session_state.pipeline_error = None
-    st.session_state.pipeline_stage = "calling_llm"
-
-    try:
-        # ---- Validate JSON input ----
-        st.session_state.pipeline_stage = "validating_json"
-        with st.spinner("Validating JSON payload..."):
+# ---------------------------------------------------------------------------
+# 1. SINGLE-PATH GUARD (Project A pattern)
+#    A button click below only flips research_active + reruns. All actual
+#    network/DDL work happens here, on the *next* run, so there is always
+#    exactly one in-flight pipeline and the UI never renders mid-mutation.
+# ---------------------------------------------------------------------------
+if st.session_state.research_active:
+    with st.status("Running Star-Schema pipeline...", expanded=True) as status:
+        st.session_state.pipeline_error = None
+        try:
+            # ---- Validate JSON input ----
+            st.session_state.pipeline_stage = "validating_json"
+            st.write("Validating JSON payload...")
             try:
                 json.loads(st.session_state.raw_json_input)
                 console.log_json_validation(0.01, True, None)
@@ -201,64 +226,84 @@ def run_pipeline() -> None:
                 console.log_json_validation(0.01, False, str(exc))
                 raise SchemaGenerationError(f"Invalid JSON payload: {exc}") from exc
 
-        # ---- Call LLM ----
-        st.session_state.pipeline_stage = "calling_llm"
-        with st.spinner("Calling Gemini 3.5 Flash for schema design..."):
-            generator = StarSchemaGenerator(api_key=st.session_state.api_key)
+            # ---- Call LLM ----
+            st.session_state.pipeline_stage = "calling_llm"
+            st.write(f"Calling Gemini ({' → '.join(MODEL_CHAIN)})...")
+            generator = StarSchemaGenerator(api_key=st.session_state.api_key, models=MODEL_CHAIN)
             call_result = generator.generate(st.session_state.raw_json_input)
             st.session_state.llm_call_result = call_result
             console.log_llm_call(call_result)
 
-        # ---- Execute DDL ----
-        st.session_state.pipeline_stage = "executing_ddl"
-        with st.spinner("Validating DDL against in-memory DuckDB sandbox..."):
+            # ---- Execute DDL ----
+            st.session_state.pipeline_stage = "executing_ddl"
+            st.write("Validating DDL against in-memory DuckDB sandbox...")
             runner = DuckDBSandboxRunner()
             try:
                 report = runner.execute_ddl(call_result.response.duckdb_ddl)
                 st.session_state.ddl_execution_report = report
                 console.log_ddl_execution(report)
-
                 if not report.success:
                     raise DDLExecutionError(
-                        report.failed_statement or "",
-                        Exception(report.error_message),
+                        report.failed_statement or "", Exception(report.error_message)
                     )
             finally:
                 runner.close()
 
-        # ---- Success ----
-        st.session_state.schema_result = call_result.response
-        st.session_state.pipeline_stage = "complete"
-        st.session_state.last_run_timestamp = dt.datetime.now()
+            # ---- Success ----
+            st.session_state.schema_result = call_result.response
+            st.session_state.pipeline_stage = "complete"
+            st.session_state.last_run_timestamp = dt.datetime.now()
+            st.session_state.pipeline_error = None
+            st.session_state.research_active = False
+            status.update(label="Star-Schema generated!", state="complete", expanded=False)
+            st.rerun()
 
-    except SchemaGenerationError as exc:
-        st.session_state.pipeline_error = f"LLM generation failed: {exc}"
-        st.session_state.pipeline_stage = "error"
-    except SchemaValidationError as exc:
-        st.session_state.pipeline_error = f"Schema validation failed: {exc}"
-        st.session_state.pipeline_stage = "error"
-    except DDLExecutionError as exc:
-        st.session_state.pipeline_error = f"DuckDB DDL execution failed: {exc}"
-        st.session_state.pipeline_stage = "error"
-    finally:
-        st.session_state.research_active = False
+        except Exception as e:
+            err_str = str(e)
+            err_type = type(e).__name__
 
+            # Categorized, human-readable error mapping (same taxonomy as
+            # the working reference project) instead of a raw traceback.
+            if isinstance(e, SchemaValidationError) or "validation" in err_str.lower() or "pydantic" in err_str.lower():
+                msg = f"Schema Validation Failure: AI returned malformed JSON. {err_str}"
+            elif isinstance(e, DDLExecutionError):
+                msg = f"DuckDB DDL Execution Failure: {err_str}"
+            elif "quota" in err_str.lower() or "429" in err_str or "rate limit" in err_str.lower():
+                msg = f"API Quota / Rate Limit Exhaustion: {err_str}"
+            elif "503" in err_str or "overloaded" in err_str.lower() or "unavailable" in err_str.lower():
+                msg = f"Model Server Overloaded (503): {err_str}"
+            elif "404" in err_str or "not_found" in err_str.lower():
+                msg = f"Model Not Found (404) — check GEMINI_MODELS: {err_str}"
+            elif "timeout" in err_str.lower() or "deadline" in err_str.lower():
+                msg = f"Network Timeout / Server Unavailable: {err_str}"
+            elif "api_key" in err_str.lower() or "auth" in err_str.lower() or "401" in err_str or "403" in err_str:
+                msg = f"Authentication Error: Invalid or missing GOOGLE_API_KEY. {err_str}"
+            else:
+                msg = f"Unexpected System Error ({err_type}): {err_str}"
 
-# ---- Orchestration: runs BEFORE any tab is rendered ----
+            st.session_state.pipeline_error = msg
+            st.session_state.pipeline_stage = "error"
+            st.session_state.research_active = False
+            status.update(label="Pipeline Failed!", state="error", expanded=True)
+            st.rerun()
+
+# ---------------------------------------------------------------------------
+# 2. UI Rendering (purely state-driven)
+# ---------------------------------------------------------------------------
 generate_clicked = render_sidebar()
 
 if generate_clicked and not st.session_state.research_active:
+    st.session_state.pipeline_error = None
     st.session_state.research_active = True
-    run_pipeline()
+    st.rerun()
 
-# ---- Hero header ----
 st.markdown(
     """
     <div class="glass-hero">
         <h1>Data Warehouse Star-Schema Generator</h1>
         <p>Raw JSON &rarr; Pydantic-validated dimensional model &rarr; DuckDB DDL &rarr; dbt Core</p>
         <p style="margin-top: 0.5rem; font-size: 0.85rem; color: #A9C2C0;">
-            Built with Python 3.10+, Pydantic v2, Gemini 3.5 Flash, DuckDB, and Streamlit
+            Built with Python 3.10+, Pydantic v2, Gemini, DuckDB, and Streamlit
         </p>
     </div>
     """,
@@ -268,7 +313,6 @@ st.markdown(
 if st.session_state.pipeline_error:
     st.error(st.session_state.pipeline_error)
 
-# ---- Tabs render read-only from session_state ----
 tab1, tab2, tab3, tab4 = st.tabs(
     ["Visual ERD", "DuckDB DDL Sandbox", "dbt Core Files", "Pydantic Payload & Telemetry"]
 )
