@@ -54,54 +54,64 @@ def _pydantic_to_gemini_schema(model_cls: Type[pydantic.BaseModel]) -> dict:
     """
     Convert a Pydantic v2 model class to a Gemini-compatible JSON Schema dict.
 
-    Gemini's `response_schema` accepts a *flattened* JSON Schema subset. Pydantic v2's
-    `model_json_schema()` emits `$defs` + `$ref` pointers for nested models, which the
-    Gemini API rejects with `INVALID_ARGUMENT: Unsupported field: $ref`. We inline every
-    `$ref` recursively and strip Pydantic-only keywords (`min_length`, `max_length`,
-    `pattern`, `extra`, `title`, `default`) that Gemini does not understand.
+    Gemini's `response_schema` natively accepts a strict subset of JSON Schema. 
+    Pydantic v2 emits `$defs`/`$ref` pointers, `additionalProperties`, `anyOf`, and 
+    other validation constraints that the Gemini API rejects with a 400 INVALID_ARGUMENT error.
+    We recursively flatten `$ref`s, extract types from `anyOf` (Optionals), and strictly 
+    allowlist only the fields Gemini understands.
     """
     raw = model_cls.model_json_schema()
     defs = raw.pop("$defs", {})
 
-    BLOCKED_KEYS = {
-        "title", "default", "min_length", "max_length",
-        "max_items", "min_items", "extra", "examples",
+    # Gemini's protobuf mapping strictly accepts only these JSON schema keys.
+    ALLOWED_KEYS = {
+        "type", "format", "description", "nullable", "enum",
+        "maxItems", "minItems", "properties", "items", "required",
+        "minimum", "maximum",
     }
 
     def _resolve(node):
         if not isinstance(node, dict):
             return node
-        # Inline $ref
+        
+        # 1. Inline $ref recursively
         if "$ref" in node:
             ref_name = node["$ref"].split("/")[-1]
             return _resolve({**defs[ref_name], **{k: v for k, v in node.items() if k != "$ref"}})
-        # Recurse + strip unsupported keys
+        
+        # 2. Handle Optional fields (anyOf)
+        if "anyOf" in node:
+            non_null = next((s for s in node["anyOf"] if s.get("type") != "null"), node["anyOf"][0])
+            resolved = _resolve(non_null)
+            resolved["nullable"] = True
+            return resolved
+
+        # 3. Recurse and allowlist keys
         cleaned: dict = {}
         for k, v in node.items():
-            if k in BLOCKED_KEYS:
+            if k not in ALLOWED_KEYS:
                 continue
+            
             if k == "type" and isinstance(v, list):
-                # Pydantic emits ["string", "null"] for Optional[str].
-                # Gemini accepts only a single type string; fall back to first non-null.
+                # Pydantic emits ["string", "null"] for Optional[str] sometimes.
                 cleaned["type"] = next(t for t in v if t != "null")
-                cleaned.setdefault("nullable", True)
-                continue
-            if k == "anyOf":
-                # Optional fields arrive as anyOf[{type:...},{type:null}]
-                non_null = next((s for s in v if s.get("type") != "null"), v[0])
-                cleaned.update(_resolve(non_null))
                 cleaned["nullable"] = True
                 continue
+            
             if k == "properties":
                 cleaned["properties"] = {pk: _resolve(pv) for pk, pv in v.items()}
                 continue
+                
             if k == "items":
                 cleaned["items"] = _resolve(v)
                 continue
+                
             if k == "enum":
                 cleaned["enum"] = list(v)
                 continue
+                
             cleaned[k] = _resolve(v)
+            
         return cleaned
 
     return _resolve(raw)
@@ -133,8 +143,8 @@ class StarSchemaGenerator:
                 config=genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     response_mime_type="application/json",
-                    # CRITICAL: pass the flattened schema, not model_json_schema() output.
-                    # Gemini does not support $ref/$defs in response_schema.
+                    # CRITICAL: Gemini's protobuf mapping rejects unknown JSON Schema fields.
+                    # We strictly allowlist supported keys to avoid 400 INVALID_ARGUMENT errors.
                     response_schema=_pydantic_to_gemini_schema(StarSchemaResponse),
                     temperature=0.1,
                     max_output_tokens=8192,
