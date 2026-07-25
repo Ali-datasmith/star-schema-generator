@@ -1,412 +1,533 @@
 """
-llm_engine.py
+schemas.py
 
-Structured-output wrapper around the Google GenAI SDK.
+Pydantic v2 data contracts for the Data Warehouse Star-Schema Generator.
 
-This refactored version applies the working patterns from Project A:
+IMPORTANT:
+This schema is intentionally LLM-friendly.
 
-1. Use a known-good default model: gemini-3.5-flash.
-2. Allow model override via secrets/env.
-3. Use default genai.Client() when no explicit API key is supplied.
-4. Prefer response.parsed for native structured-output parsing.
-5. Use bounded retries with exponential backoff only for transient errors.
-6. Classify errors into human-readable operational categories.
-7. Avoid aggressive fallback storms on the free tier.
+The original version used strict JSON-schema constraints such as:
+- extra="forbid"
+- pattern=...
+- min_length=...
+- enum values like "DECIMAL(18,2)"
+
+Those constraints are useful for runtime validation, but they can cause
+Gemini structured-output requests to fail with 400 INVALID_ARGUMENT.
+
+This version removes aggressive LLM-facing constraints and enforces the
+same business rules using Pydantic validators after parsing.
 """
 
 from __future__ import annotations
 
-import json
-import logging
-import os
-import random
-import time
-from dataclasses import dataclass
-from typing import Any, List, Optional
+from enum import Enum
+from typing import List, Literal, Optional
 
-from google import genai
-from google.genai import types as genai_types
-
-from app.schemas import StarSchemaResponse
-
-logger = logging.getLogger(__name__)
-
-DEFAULT_MODEL = "gemini-3.5-flash"
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-class SchemaGenerationError(Exception):
-    """Raised when the LLM call itself fails (network, auth, quota, timeout)."""
-
-
-class SchemaValidationError(Exception):
-    """Raised when the LLM response cannot be validated against StarSchemaResponse."""
-
-
-SYSTEM_INSTRUCTION = """You are a senior data warehouse architect.
-
-Given a raw JSON payload from a source system, design a Kimball-style dimensional star schema for DuckDB.
-
-Rules:
-1. Produce exactly one fact table.
-2. Produce one or more dimension tables.
-3. All table and column names must be lower_snake_case.
-4. Dimension tables must be prefixed with 'dim_'.
-5. Dimension tables must carry an integer surrogate key.
-6. The fact table must be prefixed with 'fct_'.
-7. The fact table must reference every dimension surrogate key as a foreign key.
-8. Emit fully executable DuckDB DDL.
-9. Use CREATE SEQUENCE plus DEFAULT nextval() for every surrogate key.
-10. Emit complete dbt Core staging models, mart models, and schema.yml.
-11. Include unique, not_null, and relationships tests in schema.yml.
-12. Use only simple DuckDB data types from the response schema.
-13. Keep dbt models concise but production-ready.
-14. Return only a valid JSON object matching the response schema.
-15. Do not include markdown fences, prose, or commentary.
-"""
-
-
-def _get_config_value(key: str, default: str = "") -> str:
+class DuckDBDataType(str, Enum):
     """
-    Resolve configuration from Streamlit secrets first, then environment variables.
+    Whitelisted DuckDB column types the LLM is permitted to emit.
 
-    This mirrors Project A's deployment-friendly behavior.
+    These values are intentionally simple strings to avoid structured-output
+    schema issues with values such as "DECIMAL(18,2)".
     """
 
-    try:
-        import streamlit as st
+    BIGINT = "BIGINT"
+    INTEGER = "INTEGER"
+    VARCHAR = "VARCHAR"
+    DECIMAL = "DECIMAL"
+    DOUBLE = "DOUBLE"
+    BOOLEAN = "BOOLEAN"
+    DATE = "DATE"
+    TIMESTAMP = "TIMESTAMP"
+    TIME = "TIME"
 
-        value = st.secrets.get(key, os.environ.get(key, default))
-        return str(value or default)
-    except Exception:
-        return str(os.environ.get(key, default) or default)
+
+class MeasureType(str, Enum):
+    ADDITIVE = "additive"
+    SEMI_ADDITIVE = "semi_additive"
+    NON_ADDITIVE = "non_additive"
+    NONE = "none"
 
 
-def resolve_model_chain() -> List[str]:
+def _normalize_duckdb_type(value: object) -> object:
     """
-    Resolve the model chain.
+    Normalize common type aliases into the whitelisted enum values.
 
-    Default:
-        ["gemini-3.5-flash"]
-
-    Optional fallback:
-        GEMINI_FALLBACK_MODELS = "gemini-2.5-flash,gemini-2.0-flash"
-
-    Fallback models are intentionally opt-in to avoid 404s from stale hardcoded models.
-    """
-
-    primary = _get_config_value("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    fallback_raw = _get_config_value("GEMINI_FALLBACK_MODELS", "").strip()
-
-    chain: List[str] = [primary]
-
-    if fallback_raw:
-        for model in fallback_raw.split(","):
-            model = model.strip()
-            if model and model not in chain:
-                chain.append(model)
-
-    return chain
-
-
-def _error_text(exc: Exception) -> str:
-    return f"{type(exc).__name__}: {exc}".lower()
-
-
-def _is_transient_error(exc: Exception) -> bool:
-    """
-    Detect transient free-tier / server-side errors where a bounded retry is safe.
+    This allows the LLM or downstream users to provide values such as:
+    - DECIMAL(18,2)
+    - NUMERIC(10,2)
+    - TEXT
+    - STRING
+    - INT
+    - DATETIME
     """
 
-    text = _error_text(exc)
+    if isinstance(value, DuckDBDataType):
+        return value
 
-    transient_codes = (
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-    )
+    if isinstance(value, str):
+        v = value.strip().upper()
 
-    transient_keywords = (
-        "quota",
-        "resource_exhausted",
-        "unavailable",
-        "overloaded",
-        "timeout",
-        "deadline",
-        "connection",
-        "aborted",
-        "internal",
-        "server error",
-        "temporarily",
-    )
+        if not v:
+            return value
 
-    return any(code in text for code in transient_codes) or any(
-        keyword in text for keyword in transient_keywords
-    )
+        if v.startswith("DECIMAL") or v.startswith("NUMERIC"):
+            return DuckDBDataType.DECIMAL.value
 
-
-def _is_not_found_error(exc: Exception) -> bool:
-    """
-    Detect model/resource not found errors. These should trigger fallback, not retry.
-    """
-
-    text = _error_text(exc)
-
-    return (
-        "404" in text
-        or "not_found" in text
-        or "not found" in text
-        or "model not found" in text
-    )
-
-
-def _is_auth_error(exc: Exception) -> bool:
-    """
-    Detect authentication / permission errors. These should fail fast.
-    """
-
-    text = _error_text(exc)
-
-    return (
-        "401" in text
-        or "403" in text
-        or "api_key" in text
-        or "api key" in text
-        or "auth" in text
-        or "permission" in text
-        or "unauthenticated" in text
-    )
-
-
-def classify_error(exc: Exception) -> str:
-    """
-    Produce explicit operational error categories, matching Project A's style.
-    """
-
-    text = _error_text(exc)
-
-    if (
-        isinstance(exc, SchemaValidationError)
-        or "validation" in text
-        or "schema" in text
-        or "pydantic" in text
-    ):
-        return f"Schema Validation Failure: {exc}"
-
-    if "quota" in text or "429" in text or "resource_exhausted" in text:
-        return f"API Quota Exhaustion: {exc}"
-
-    if (
-        "timeout" in text
-        or "504" in text
-        or "deadline" in text
-        or "503" in text
-        or "unavailable" in text
-        or "overloaded" in text
-    ):
-        return f"Network Timeout / Server Unavailable: {exc}"
-
-    if (
-        "api_key" in text
-        or "api key" in text
-        or "auth" in text
-        or "401" in text
-        or "403" in text
-    ):
-        return f"Authentication Error: {exc}"
-
-    if "404" in text or "not_found" in text or "not found" in text:
-        return f"Model / Resource Not Found: {exc}"
-
-    return f"Unexpected System Error ({type(exc).__name__}): {exc}"
-
-
-@dataclass
-class LLMCallResult:
-    response: StarSchemaResponse
-    raw_text: str
-    latency_seconds: float
-    prompt_token_count: int
-    candidates_token_count: int
-    model_used: str
-
-
-class StarSchemaGenerator:
-    """
-    Thin, testable wrapper around genai.Client() for structured star-schema generation.
-    """
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model_chain: Optional[List[str]] = None,
-    ) -> None:
-        cleaned_key = (api_key or "").strip()
-
-        if cleaned_key:
-            self._client = genai.Client(api_key=cleaned_key)
-        else:
-            self._client = genai.Client()
-
-        self._model_chain = model_chain or resolve_model_chain()
-
-        # Conservative bounded retry policy.
-        # Free tiers should not be hammered with aggressive retry loops.
-        self._max_attempts_per_model = 2
-        self._base_backoff_seconds = 1.0
-
-    def _parse_response(self, response: Any) -> tuple[StarSchemaResponse, str]:
-        """
-        Prefer native structured parsing via response.parsed.
-
-        Fall back to response.text only if parsed is unavailable.
-        """
-
-        text = getattr(response, "text", None) or ""
-        parsed = getattr(response, "parsed", None)
-
-        try:
-            if parsed is not None:
-                if isinstance(parsed, StarSchemaResponse):
-                    validated = parsed
-                elif hasattr(parsed, "model_dump"):
-                    validated = StarSchemaResponse.model_validate(parsed.model_dump())
-                else:
-                    validated = StarSchemaResponse.model_validate(parsed)
-            elif text:
-                validated = StarSchemaResponse.model_validate_json(text)
-            else:
-                raise SchemaGenerationError("Gemini returned an empty response body.")
-        except SchemaGenerationError:
-            raise
-        except Exception as exc:
-            preview = text[:2000] if text else "<no response text>"
-            raise SchemaValidationError(
-                f"LLM output failed StarSchemaResponse validation: {exc}\n"
-                f"Raw output preview: {preview}"
-            ) from exc
-
-        if not text:
-            try:
-                text = json.dumps(validated.model_dump(mode="json"), default=str)
-            except Exception:
-                text = ""
-
-        return validated, text
-
-    def _generate_once(
-        self,
-        model: str,
-        raw_json_payload: str,
-    ) -> tuple[StarSchemaResponse, str, Any]:
-        """
-        Execute one structured generation call.
-
-        This mirrors Project A's simpler call pattern:
-        - contents is a plain string
-        - response_mime_type is application/json
-        - response_schema is a Pydantic model
-        """
-
-        config_kwargs: dict[str, Any] = {
-            "system_instruction": SYSTEM_INSTRUCTION,
-            "response_mime_type": "application/json",
-            "response_schema": StarSchemaResponse,
-            "temperature": 0.2,
+        aliases = {
+            "TEXT": DuckDBDataType.VARCHAR.value,
+            "STRING": DuckDBDataType.VARCHAR.value,
+            "CHAR": DuckDBDataType.VARCHAR.value,
+            "CHARACTER": DuckDBDataType.VARCHAR.value,
+            "INT": DuckDBDataType.INTEGER.value,
+            "INT4": DuckDBDataType.INTEGER.value,
+            "SIGNED": DuckDBDataType.INTEGER.value,
+            "LONG": DuckDBDataType.BIGINT.value,
+            "INT8": DuckDBDataType.BIGINT.value,
+            "FLOAT": DuckDBDataType.DOUBLE.value,
+            "REAL": DuckDBDataType.DOUBLE.value,
+            "DOUBLE PRECISION": DuckDBDataType.DOUBLE.value,
+            "BOOL": DuckDBDataType.BOOLEAN.value,
+            "DATETIME": DuckDBDataType.TIMESTAMP.value,
         }
 
-        # Optional override. Not set by default to mirror Project A's working behavior.
-        # If output truncation occurs, set:
-        #   GEMINI_MAX_OUTPUT_TOKENS = "8192"
-        # in Streamlit secrets or environment.
-        max_output_tokens = _get_config_value("GEMINI_MAX_OUTPUT_TOKENS", "").strip()
-        if max_output_tokens.isdigit():
-            config_kwargs["max_output_tokens"] = int(max_output_tokens)
+        return aliases.get(v, v)
 
-        response = self._client.models.generate_content(
-            model=model,
-            contents=raw_json_payload,
-            config=genai_types.GenerateContentConfig(**config_kwargs),
-        )
+    return value
 
-        validated, raw_text = self._parse_response(response)
-        usage = getattr(response, "usage_metadata", None)
 
-        return validated, raw_text, usage
+def _validate_identifier(value: object, field_name: str) -> str:
+    """
+    Validate lower_snake_case identifiers.
 
-    def generate(self, raw_json_payload: str) -> LLMCallResult:
-        """
-        Generate and validate a StarSchemaResponse.
+    This replaces regex constraints in Field(...) to avoid structured-output
+    schema rejection while preserving the same runtime rule.
+    """
 
-        Resilience policy:
-        - Auth errors fail fast.
-        - Transient errors retry with exponential backoff.
-        - Model-not-found and validation errors fall back to the next configured model.
-        - Default configuration uses one known-good model to avoid free-tier fallback storms.
-        """
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string.")
 
-        start = time.perf_counter()
-        last_exception: Optional[Exception] = None
+    v = value.strip()
 
-        for model in self._model_chain:
-            for attempt in range(1, self._max_attempts_per_model + 1):
-                try:
-                    logger.info(
-                        "Attempting structured generation with model=%s attempt=%s",
-                        model,
-                        attempt,
-                    )
+    if not v:
+        raise ValueError(f"{field_name} must not be empty.")
 
-                    validated, raw_text, usage = self._generate_once(
-                        model=model,
-                        raw_json_payload=raw_json_payload,
-                    )
+    if v[0].isdigit():
+        raise ValueError(f"{field_name} '{v}' must not start with a digit.")
 
-                    latency = time.perf_counter() - start
+    if not v.replace("_", "").isalnum() or v != v.lower():
+        raise ValueError(f"{field_name} '{v}' must be lower_snake_case.")
 
-                    return LLMCallResult(
-                        response=validated,
-                        raw_text=raw_text,
-                        latency_seconds=latency,
-                        prompt_token_count=getattr(usage, "prompt_token_count", 0) or 0,
-                        candidates_token_count=getattr(usage, "candidates_token_count", 0) or 0,
-                        model_used=model,
-                    )
+    return v
 
-                except Exception as exc:
-                    last_exception = exc
 
-                    logger.warning(
-                        "Model %s attempt %s failed: %s",
-                        model,
-                        attempt,
-                        exc,
-                    )
+def _validate_table_name(value: object, prefix: str) -> str:
+    """
+    Validate table names such as:
+    - dim_customer
+    - fct_orders
+    """
 
-                    # Fail fast on auth errors.
-                    if _is_auth_error(exc):
-                        raise SchemaGenerationError(classify_error(exc)) from exc
+    v = _validate_identifier(value, "table_name")
 
-                    # Retry transient errors with bounded exponential backoff.
-                    if _is_transient_error(exc) and attempt < self._max_attempts_per_model:
-                        sleep_for = (
-                            self._base_backoff_seconds * (2 ** (attempt - 1))
-                            + random.uniform(0.0, 0.25)
-                        )
-                        logger.info(
-                            "Transient error detected. Sleeping %.2f seconds before retry.",
-                            sleep_for,
-                        )
-                        time.sleep(sleep_for)
-                        continue
+    if not v.startswith(prefix):
+        raise ValueError(f"table_name '{v}' must be prefixed with '{prefix}'.")
 
-                    # For not-found, validation, empty-body, or non-transient errors,
-                    # stop retrying this model and try the next configured model.
-                    break
+    if len(v) <= len(prefix):
+        raise ValueError(f"table_name '{v}' must contain a name after '{prefix}'.")
 
-        raise SchemaGenerationError(
-            classify_error(last_exception)
-            if last_exception
-            else "All models in the fallback chain failed."
-        ) from last_exception
+    return v
+
+
+class DimensionColumn(BaseModel):
+    """A single attribute column on a dimension table."""
+
+    name: str = Field(
+        ...,
+        description="Column name in lower_snake_case.",
+    )
+
+    data_type: DuckDBDataType = Field(
+        ...,
+        description="DuckDB-native SQL data type.",
+    )
+
+    is_surrogate_key: bool = Field(
+        default=False,
+        description="True if this column is the auto-generated integer surrogate key.",
+    )
+
+    is_business_key: bool = Field(
+        default=False,
+        description="True if this column is the natural/business key from the source system.",
+    )
+
+    description: str = Field(
+        ...,
+        description="Human-readable description of the column's business meaning.",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: object) -> str:
+        return _validate_identifier(v, "name")
+
+    @field_validator("data_type", mode="before")
+    @classmethod
+    def validate_data_type(cls, v: object) -> object:
+        return _normalize_duckdb_type(v)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v: object) -> str:
+        if not isinstance(v, str):
+            raise ValueError("description must be a string.")
+
+        v_clean = v.strip()
+
+        if not v_clean:
+            raise ValueError("description must not be empty.")
+
+        return v_clean
+
+
+class DimensionTable(BaseModel):
+    """A single dimension table, e.g. dim_customer."""
+
+    table_name: str = Field(
+        ...,
+        description="Dimension table name, must be prefixed with 'dim_'.",
+    )
+
+    surrogate_key_name: str = Field(
+        ...,
+        description="Name of the surrogate key column, e.g. 'customer_sk'.",
+    )
+
+    attributes: List[DimensionColumn] = Field(
+        ...,
+        description=(
+            "Ordered list of dimension attribute columns, including the surrogate key column."
+        ),
+    )
+
+    @field_validator("table_name")
+    @classmethod
+    def validate_table_name(cls, v: object) -> str:
+        return _validate_table_name(v, "dim_")
+
+    @field_validator("surrogate_key_name")
+    @classmethod
+    def validate_surrogate_key_name(cls, v: object) -> str:
+        return _validate_identifier(v, "surrogate_key_name")
+
+    @model_validator(mode="after")
+    def validate_surrogate_key_present(self) -> "DimensionTable":
+        if not self.attributes:
+            raise ValueError(
+                f"DimensionTable '{self.table_name}' must declare at least one attribute column."
+            )
+
+        sk_columns = [c for c in self.attributes if c.is_surrogate_key]
+
+        if len(sk_columns) != 1:
+            raise ValueError(
+                f"DimensionTable '{self.table_name}' must declare exactly one "
+                f"is_surrogate_key=True column, found {len(sk_columns)}."
+            )
+
+        if sk_columns[0].name != self.surrogate_key_name:
+            raise ValueError(
+                f"surrogate_key_name '{self.surrogate_key_name}' must match the "
+                f"flagged surrogate column name '{sk_columns[0].name}'."
+            )
+
+        return self
+
+
+class FactColumn(BaseModel):
+    """A single column on a fact table — key or measure."""
+
+    name: str = Field(
+        ...,
+        description="Column name in lower_snake_case.",
+    )
+
+    data_type: DuckDBDataType = Field(
+        ...,
+        description="DuckDB-native SQL data type.",
+    )
+
+    is_primary_key: bool = Field(
+        default=False,
+        description="True if this column is the fact table's primary key.",
+    )
+
+    is_foreign_key: bool = Field(
+        default=False,
+        description="True if this column references a dimension surrogate key.",
+    )
+
+    references_table: Optional[str] = Field(
+        default=None,
+        description="Name of the dimension table referenced. Required if is_foreign_key=True.",
+    )
+
+    measure_type: MeasureType = Field(
+        default=MeasureType.NONE,
+        description="Additive classification of the measure; 'none' for key columns.",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: object) -> str:
+        return _validate_identifier(v, "name")
+
+    @field_validator("data_type", mode="before")
+    @classmethod
+    def validate_data_type(cls, v: object) -> object:
+        return _normalize_duckdb_type(v)
+
+    @field_validator("references_table", mode="before")
+    @classmethod
+    def normalize_references_table(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def validate_fk_reference(self) -> "FactColumn":
+        if self.is_foreign_key and not self.references_table:
+            raise ValueError(
+                f"FactColumn '{self.name}' has is_foreign_key=True but references_table is not set."
+            )
+
+        if not self.is_foreign_key and self.references_table:
+            raise ValueError(
+                f"FactColumn '{self.name}' sets references_table but is_foreign_key=False."
+            )
+
+        return self
+
+
+class FactTable(BaseModel):
+    """The single generated fact table, e.g. fct_orders."""
+
+    table_name: str = Field(
+        ...,
+        description="Fact table name, must be prefixed with 'fct_'.",
+    )
+
+    primary_key: str = Field(
+        ...,
+        description="Name of the fact table's primary key column.",
+    )
+
+    foreign_keys: List[str] = Field(
+        default_factory=list,
+        description="List of foreign key column names on this fact table.",
+    )
+
+    measures: List[FactColumn] = Field(
+        ...,
+        description="All columns on the fact table, including keys and measures.",
+    )
+
+    ddl_sql: str = Field(
+        ...,
+        description="Fully-formed CREATE TABLE DDL statement for this fact table.",
+    )
+
+    @field_validator("table_name")
+    @classmethod
+    def validate_table_name(cls, v: object) -> str:
+        return _validate_table_name(v, "fct_")
+
+    @field_validator("primary_key")
+    @classmethod
+    def validate_primary_key(cls, v: object) -> str:
+        return _validate_identifier(v, "primary_key")
+
+    @field_validator("ddl_sql")
+    @classmethod
+    def validate_ddl_sql(cls, v: object) -> str:
+        if not isinstance(v, str):
+            raise ValueError("ddl_sql must be a string.")
+
+        v_clean = v.strip()
+
+        if not v_clean:
+            raise ValueError("ddl_sql must not be empty.")
+
+        return v_clean
+
+    @model_validator(mode="after")
+    def validate_foreign_keys_present(self) -> "FactTable":
+        if not self.measures:
+            raise ValueError(
+                f"FactTable '{self.table_name}' must declare at least one column in measures."
+            )
+
+        declared_fk_names = {c.name for c in self.measures if c.is_foreign_key}
+
+        for fk in self.foreign_keys:
+            if fk not in declared_fk_names:
+                raise ValueError(
+                    f"foreign_keys entry '{fk}' has no matching FactColumn with is_foreign_key=True."
+                )
+
+        return self
+
+
+class DbtSqlFile(BaseModel):
+    """A single generated dbt SQL file."""
+
+    filename: str = Field(
+        ...,
+        description="File name including extension, e.g. 'stg_stripe_orders.sql'.",
+    )
+
+    model_type: Literal["staging", "dimension", "fact"] = Field(
+        ...,
+        description="Category of dbt model: 'staging', 'dimension', or 'fact'.",
+    )
+
+    content: str = Field(
+        ...,
+        description="Full Jinja + SQL file content, copy-pasteable into a dbt project.",
+    )
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, v: object) -> str:
+        if not isinstance(v, str):
+            raise ValueError("filename must be a string.")
+
+        v_clean = v.strip()
+
+        if not v_clean:
+            raise ValueError("filename must not be empty.")
+
+        return v_clean
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, v: object) -> str:
+        if not isinstance(v, str):
+            raise ValueError("content must be a string.")
+
+        v_clean = v.strip()
+
+        if not v_clean:
+            raise ValueError("content must not be empty.")
+
+        return v_clean
+
+
+class DbtModelBundle(BaseModel):
+    """All dbt Core artifacts required to materialize the star schema."""
+
+    staging_models: List[DbtSqlFile] = Field(
+        ...,
+        description="stg_*.sql staging views, one per raw source entity.",
+    )
+
+    mart_models: List[DbtSqlFile] = Field(
+        ...,
+        description="dim_*.sql and fct_*.sql mart models.",
+    )
+
+    schema_yml: str = Field(
+        ...,
+        description="Full contents of schema.yml declaring sources, models, columns, and tests.",
+    )
+
+    @field_validator("schema_yml")
+    @classmethod
+    def validate_schema_yml(cls, v: object) -> str:
+        if not isinstance(v, str):
+            raise ValueError("schema_yml must be a string.")
+
+        v_clean = v.strip()
+
+        if not v_clean:
+            raise ValueError("schema_yml must not be empty.")
+
+        return v_clean
+
+    @model_validator(mode="after")
+    def validate_bundles(self) -> "DbtModelBundle":
+        if not self.staging_models:
+            raise ValueError("dbt_models.staging_models must contain at least one staging model.")
+
+        if not self.mart_models:
+            raise ValueError("dbt_models.mart_models must contain at least one mart model.")
+
+        return self
+
+
+class StarSchemaResponse(BaseModel):
+    """Root response model returned by the LLM and validated end-to-end."""
+
+    fact_table: FactTable = Field(
+        ...,
+        description="The single generated fact table.",
+    )
+
+    dimensions: List[DimensionTable] = Field(
+        ...,
+        description="All generated dimension tables.",
+    )
+
+    duckdb_ddl: str = Field(
+        ...,
+        description=(
+            "Concatenated, executable DuckDB DDL that defines the star schema's "
+            "STRUCTURE ONLY: CREATE TABLE statements with PRIMARY KEY and "
+            "REFERENCES (foreign key) constraints, dimensions declared before the "
+            "fact table. Surrogate key columns are plain INTEGER PRIMARY KEY with "
+            "NO default. Do NOT include CREATE SEQUENCE statements and do NOT use "
+            "nextval() or any auto-increment default — surrogate key VALUES are "
+            "assigned by the dbt mart models (row_number over a deterministic "
+            "natural-key order), never by the DDL."
+        ),
+    )
+
+    dbt_models: DbtModelBundle = Field(
+        ...,
+        description="Generated dbt Core staging and mart models plus schema.yml.",
+    )
+
+    @field_validator("duckdb_ddl")
+    @classmethod
+    def validate_duckdb_ddl(cls, v: object) -> str:
+        if not isinstance(v, str):
+            raise ValueError("duckdb_ddl must be a string.")
+
+        v_clean = v.strip()
+
+        if not v_clean:
+            raise ValueError("duckdb_ddl must not be empty.")
+
+        return v_clean
+
+    @model_validator(mode="after")
+    def validate_fk_targets_exist(self) -> "StarSchemaResponse":
+        if not self.dimensions:
+            raise ValueError("StarSchemaResponse must contain at least one dimension table.")
+
+        dim_names = {d.table_name for d in self.dimensions}
+
+        for col in self.fact_table.measures:
+            if col.is_foreign_key and col.references_table not in dim_names:
+                raise ValueError(
+                    f"FactColumn '{col.name}' references_table='{col.references_table}' "
+                    f"does not match any generated DimensionTable.table_name. "
+                    f"Available dimensions: {sorted(dim_names)}"
+                )
+
+        return self
