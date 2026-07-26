@@ -1,6 +1,7 @@
 <div align="center">
   <img src="blob:https://gemini.google.com/5a2674d0-3065-4be1-89ab-6fe24c1fb62f"/>
   <img width="1024" height="434" alt="Data Warehouse Star-Schema Generator — generated star schema and blueprint ERD" src="https://github.com/user-attachments/assets/bdcec08a-8855-4b1a-8ca1-5630e8db3dfc" />
+  <!-- SCREENSHOT_PLACEHOLDER: optionally add more app screenshots here (blueprint ERD, generated DDL, dbt scaffold, Telemetry tab) — this comment is invisible to readers -->
 </div>
 
 # Data Warehouse Star-Schema Generator
@@ -27,7 +28,6 @@
 - [Error Handling](#error-handling)
 - [Design Principles](#design-principles)
 - [License](#license)
-- [Placeholders to Fill](#placeholders-to-fill)
 
 <a id="demo"></a>
 ## 🎥 Demo
@@ -248,10 +248,3 @@ Open the local URL Streamlit prints (typically `http://localhost:8501`), paste i
 ## License
 
 Released under the MIT License. See [`LICENSE`](https://github.com/Ali-datasmith/star-schema-generator/blob/main/LICENSE) for details.
-
-## Placeholders to Fill
-
-- [x] **Demo video** — added (see [🎥 Demo](#demo))
-- [ ] **Screenshots** _(optional)_ — add app screenshots: hero view, blueprint ERD, generated DDL, dbt scaffold, Telemetry tab
-
-<!-- SCREENSHOT_PLACEHOLDER: add app screenshot(s) here — hero view, blueprint ERD, generated DDL, dbt scaffold, Telemetry tab -->
