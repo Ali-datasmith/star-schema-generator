@@ -1,4 +1,7 @@
-<img src="blob:https://gemini.google.com/5a2674d0-3065-4be1-89ab-6fe24c1fb62f"/><img width="1024" height="434" alt="image" src="https://github.com/user-attachments/assets/bdcec08a-8855-4b1a-8ca1-5630e8db3dfc" />
+<div align="center">
+  <img src="blob:https://gemini.google.com/5a2674d0-3065-4be1-89ab-6fe24c1fb62f" alt="App demo preview" />
+  <img width="1024" height="434" alt="Data Warehouse Star-Schema Generator — generated star schema and blueprint ERD" src="https://github.com/user-attachments/assets/bdcec08a-8855-4b1a-8ca1-5630e8db3dfc" />
+</div>
 
 # Data Warehouse Star-Schema Generator
 
@@ -13,7 +16,7 @@
 
 ## Table of Contents
 
-- [🎥 Demo](#-demo)
+- [🎥 Demo](#demo)
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Features](#features)
@@ -26,12 +29,14 @@
 - [License](#license)
 - [Placeholders to Fill](#placeholders-to-fill)
 
+<a id="demo"></a>
 ## 🎥 Demo
 
 <!-- LOOM_VIDEO_PLACEHOLDER: paste your Loom share link or iframe embed below this line -->
-> 🎬 **Video walkthrough:** _[https://github.com/user-attachments/assets/2e346f4c-e93f-4d87-88b5-7af2a630cf6e]_
 
-<!-- Optional: when ready, replace the blockquote above with an embed, e.g.
+**▶ Watch the walkthrough:** <https://github.com/user-attachments/assets/034d6166-6f5f-42a2-8c15-3aadf383aac6>
+
+<!-- Optional: when ready, replace the link above with an embed, e.g.
 <div style="position: relative; padding-bottom: 56.25%; height: 0;">
   <iframe src="PASTE_YOUR_LOOM_EMBED_URL_HERE" frameborder="0"
     webkitallowfullscreen mozallowfullscreen allowfullscreen
@@ -51,33 +56,13 @@ It's built to hold up on the free tier: one inference call per run, a determinis
 
 Single-call pipeline — one Gemini request in, one validated dimensional model out.
 
-```text
-User JSON
-   │
-   ▼
-main.py                  single-path execution guard (research_active)
-   │
-   ▼
-llm_engine.py             structured generation via google-genai SDK
-   │                      Gemini 3.5 Flash → response.parsed
-   ▼
-schemas.py                Pydantic v2 validation
-   │                      naming rules, SK/FK integrity, prefixes
-   ▼
-duckdb_runner.py          in-memory DDL sandbox
-   │                      short-circuits on first failing statement
-   ▼
-ui/tabs.py                state-driven rendering
-                           ERD / DDL / dbt / Telemetry tabs
-```
-
 ```mermaid
 flowchart TD
-    A[User JSON input] --> B["main.py — single-path execution guard (research_active)"]
-    B --> C["llm_engine.py — structured generation (Gemini 3.5 Flash)"]
-    C --> D["schemas.py — Pydantic v2 validation & business rules"]
-    D --> E["duckdb_runner.py — in-memory DuckDB DDL sandbox"]
-    E --> F["ui/tabs.py — renders from persisted st.session_state"]
+    A["User JSON input"] --> B["main.py · single-path execution guard (research_active)"]
+    B --> C["llm_engine.py · structured generation — Gemini 3.5 Flash → response.parsed"]
+    C --> D["schemas.py · Pydantic v2 validation & business rules"]
+    D --> E["duckdb_runner.py · in-memory DuckDB DDL sandbox (short-circuits on first failure)"]
+    E --> F["ui/tabs.py · renders from persisted st.session_state (ERD / DDL / dbt / Telemetry)"]
 ```
 
 ## Features
@@ -100,7 +85,7 @@ Because these rules live in validators rather than the schema passed to the API,
 
 ### Resilient free-tier execution
 
-- Known-good default model, with optional fallback models
+- Known-good default model, with optional opt-in fallback models
 - Works with a default `genai.Client()` when no key is explicitly threaded through
 - Prefers `response.parsed` over manual JSON parsing
 - Bounded exponential backoff — only on transient errors (timeouts, rate limits), never on auth or validation failures
@@ -190,7 +175,7 @@ source .venv/bin/activate      # on Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Works out of the box on Google Colab for experimentation, and deploys directly to Streamlit Community Cloud (free tier) as a hosted app — see [Configuration](#configuration).
+Deploys directly to Streamlit Community Cloud (free tier) as a hosted app — see [Configuration](#configuration).
 
 ## Configuration
 
@@ -203,7 +188,7 @@ export GOOGLE_API_KEY="your-gemini-api-key-here"
 
 # Optional overrides
 export GEMINI_MODEL="gemini-3.5-flash"
-export GEMINI_FALLBACK_MODELS="gemini-3.5-flash-8b,gemini-2.0-flash"
+export GEMINI_FALLBACK_MODELS="gemini-2.5-flash"
 export GEMINI_MAX_OUTPUT_TOKENS="8192"
 ```
 
@@ -218,7 +203,7 @@ GOOGLE_API_KEY = "your-gemini-api-key-here"
 
 # Optional
 GEMINI_MODEL = "gemini-3.5-flash"
-GEMINI_FALLBACK_MODELS = "gemini-3.5-flash-8b,gemini-2.0-flash"
+GEMINI_FALLBACK_MODELS = "gemini-2.5-flash"
 GEMINI_MAX_OUTPUT_TOKENS = "8192"
 ```
 
@@ -226,7 +211,7 @@ GEMINI_MAX_OUTPUT_TOKENS = "8192"
 |---|---|---|
 | `GOOGLE_API_KEY` | Yes | Auth key for the Google GenAI SDK (`google-genai`) |
 | `GEMINI_MODEL` | No | Overrides the default known-good model |
-| `GEMINI_FALLBACK_MODELS` | No | Comma-separated fallback models if the primary model errors |
+| `GEMINI_FALLBACK_MODELS` | No | Comma-separated fallback models if the primary model errors. List **only** models your API key can access — unavailable models return a not-found error. |
 | `GEMINI_MAX_OUTPUT_TOKENS` | No | Caps generation length for large or complex JSON inputs |
 
 > Never commit `secrets.toml` or a populated `.env` file. Add both to `.gitignore` before your first commit.
@@ -248,15 +233,16 @@ Open the local URL Streamlit prints (typically `http://localhost:8501`), paste i
 | Auth | Missing or invalid `GOOGLE_API_KEY`, credential rejection | Fail-fast message asking the user to check their API key — no retry attempted |
 | Not Found | Requested model name doesn't exist or is unavailable | Message indicating the model is unavailable, with fallback models surfaced if configured |
 | Validation | A Pydantic v2 validator rejects the parsed structured response (naming, key rules, FK consistency) | Clear message naming which business rule failed, with no raw stack trace |
+| Unexpected | Any other unclassified exception (catch-all) | A labeled system-error message with the exception type, so nothing fails silently |
 
 ## Design Principles
 
-- **Single inference per execution** — exactly one Gemini call per run; no hidden retries that silently re-spend quota.
+- **Single inference per execution** — exactly one Gemini call per run; the only retries are bounded, transient-error backoffs that never re-spend quota on auth or validation failures.
 - **Deterministic state** — the `research_active` guard is the single source of truth for whether a run is in flight.
 - **Schema-first validation** — correctness is enforced by Pydantic v2 validators on the parsed model, not by trusting the LLM's raw output.
 - **UI renders from persisted state** — all four tabs read from `st.session_state` only; no tab independently triggers backend work.
 - **Explicit execution ownership** — one flag, one owner, one lifecycle.
-- **Classified errors, not stack traces** — every failure is bucketed (quota / timeout / auth / not-found / validation) before it reaches the user.
+- **Classified errors, not stack traces** — every failure is bucketed (quota / timeout / auth / not-found / validation / unexpected) before it reaches the user.
 - **Native structured parsing** — `response.parsed` is preferred over manual JSON string parsing wherever the SDK supports it.
 
 ## License
@@ -265,5 +251,7 @@ Released under the MIT License. See [`LICENSE`](https://github.com/Ali-datasmith
 
 ## Placeholders to Fill
 
-- [ ] **Loom demo video** — replace the `LOOM_VIDEO_PLACEHOLDER` block above with the real Loom link or embed
+- [x] **Demo video** — added (see [🎥 Demo](#demo))
+- [ ] **Screenshots** _(optional)_ — add app screenshots: hero view, blueprint ERD, generated DDL, dbt scaffold, Telemetry tab
+
 <!-- SCREENSHOT_PLACEHOLDER: add app screenshot(s) here — hero view, blueprint ERD, generated DDL, dbt scaffold, Telemetry tab -->
