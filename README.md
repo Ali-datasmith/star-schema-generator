@@ -29,7 +29,7 @@
 ## 🎥 Demo
 
 <!-- LOOM_VIDEO_PLACEHOLDER: paste your Loom share link or iframe embed below this line -->
-> 🎬 **Video walkthrough:** _[<video controls src="Screen recording 2026-07-26 11.32.47 AM.webm" title="Title"></video>]_
+> 🎬 **Video walkthrough:** _[https://github.com/user-attachments/assets/2e346f4c-e93f-4d87-88b5-7af2a630cf6e]_
 
 <!-- Optional: when ready, replace the blockquote above with an embed, e.g.
 <div style="position: relative; padding-bottom: 56.25%; height: 0;">
