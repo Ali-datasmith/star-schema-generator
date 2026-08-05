@@ -8,6 +8,7 @@
 
 **Raw JSON → Pydantic-validated dimensional model → DuckDB DDL → dbt Core**
 
+[![Python CI](https://github.com/Ali-datasmith/star-schema-generator/actions/workflows/ci.yml/badge.svg)](https://github.com/Ali-datasmith/star-schema-generator/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/Ali-datasmith/star-schema-generator)
 [![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-FF4B4B.svg)](https://streamlit.io/)
 [![Google GenAI SDK](https://img.shields.io/badge/Google%20GenAI-google--genai-4285F4.svg)](https://github.com/googleapis/python-genai)
@@ -17,17 +18,20 @@
 
 ## Table of Contents
 
-- [🎥 Demo](#demo)
+- [🎥 Demo](#-demo)
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Features](#features)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
+- [Testing](#testing)
 - [Configuration](#configuration)
 - [Run](#run)
 - [Error Handling](#error-handling)
+- [Honest Limitations](#honest-limitations)
 - [Design Principles](#design-principles)
 - [License](#license)
+
 
 <a id="demo"></a>
 ## 🎥 Demo
@@ -136,12 +140,21 @@ Structured, styled console output via Rich, mirrored into an in-app Telemetry ta
 
 ```text
 star-schema-generator/
-├── requirements.txt              # Python dependencies: Streamlit, google-genai, Pydantic v2, DuckDB, Rich
-├── README.md                     # This file
+├── .github/
+│   └── workflows/
+│       └── ci.yml                  # GitHub Actions CI pipeline (pytest + coverage)
+├── requirements.txt                # Python dependencies: Streamlit, google-genai, Pydantic v2, DuckDB, Rich
+├── requirements-dev.txt            # Dev dependencies: pytest, pytest-cov
+├── pytest.ini                      # Pytest configuration
+├── README.md                       # This file
+├── tests/                          # Comprehensive test suite for core business logic
+│   ├── test_duckdb_runner.py
+│   ├── test_llm_engine.py
+│   └── test_schemas.py
 └── app/
-    ├── __init__.py                # Marks app/ as a Python package
-    ├── main.py                    # Entry point — single-path execution guard, orchestrates the pipeline
-    ├── schemas.py                 # Pydantic v2 models — dimensional contracts + runtime business-rule validators
+    ├── __init__.py                 # Marks app/ as a Python package
+    ├── main.py                     # Entry point — single-path execution guard, orchestrates the pipeline
+    ├── schemas.py                  # Pydantic v2 models — dimensional contracts + runtime business-rule validators
     ├── services/
     │   ├── __init__.py             # Marks services/ as a Python package
     │   ├── llm_engine.py           # Gemini 3.5 Flash structured generation, retry/backoff, error classification
@@ -176,6 +189,20 @@ pip install -r requirements.txt
 ```
 
 Deploys directly to Streamlit Community Cloud (free tier) as a hosted app — see [Configuration](#configuration).
+
+## Testing
+
+This project maintains a comprehensive `pytest` suite to validate Pydantic schema contracts, DuckDB execution rules, and LLM error-handling paths. The suite achieves ~90% coverage on core business logic (`schemas.py`, `duckdb_runner.py`, `llm_engine.py`) while intentionally avoiding brittle UI mocking in the Streamlit layer.
+
+```bash
+# Install dev dependencies
+pip install -r requirements-dev.txt
+
+# Run the test suite with coverage
+pytest --cov=app -v
+```
+
+> **Note:** The GitHub Actions CI pipeline runs these tests automatically on every push to `main`. Because the GenAI client is fully mocked in the test suite, **no Gemini API key is required** for the CI to pass.
 
 ## Configuration
 
@@ -234,6 +261,13 @@ Open the local URL Streamlit prints (typically `http://localhost:8501`), paste i
 | Not Found | Requested model name doesn't exist or is unavailable | Message indicating the model is unavailable, with fallback models surfaced if configured |
 | Validation | A Pydantic v2 validator rejects the parsed structured response (naming, key rules, FK consistency) | Clear message naming which business rule failed, with no raw stack trace |
 | Unexpected | Any other unclassified exception (catch-all) | A labeled system-error message with the exception type, so nothing fails silently |
+
+## Honest Limitations
+
+1. **Streamlit State Contention:** The Streamlit lifecycle uses a single-path execution guard. On the free Community Cloud tier, simultaneous users hitting the "Generate" button simultaneously will overwrite `st.session_state` and cause race conditions.
+2. **Naive SQL Splitting:** The DuckDB sandbox splits DDL scripts strictly on semicolons (`;`). This will break if the LLM emits semicolons inside SQL comments (`-- comment;`) or string literals.
+3. **No Surrogate Key Stability:** Surrogate keys in the generated dbt models use `row_number()`. This assumes deterministic ordering and does not support stable SCD Type 2 history tracking across incremental runs.
+4. **LLM Cost / Caching:** The app lacks a semantic caching layer for the Gemini API. Re-running the exact same JSON payload will consume API tokens and incur costs every time.
 
 ## Design Principles
 
