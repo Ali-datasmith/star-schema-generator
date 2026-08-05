@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "star-schema-generator"
+version = "1.0.0"
+description = "Raw JSON to Pydantic-validated dimensional model, DuckDB DDL, and dbt Core."
+requires-python = ">=3.10"
+# We keep requirements.txt for Streamlit Cloud, but define them here for standard Python tooling.
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=app --cov-report=term-missing -v"
