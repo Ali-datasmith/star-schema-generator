@@ -1,5 +1,4 @@
 <div align="center">
-  <img src="blob:https://gemini.google.com/5a2674d0-3065-4be1-89ab-6fe24c1fb62f"/>
   <img width="1024" height="434" alt="Data Warehouse Star-Schema Generator — generated star schema and blueprint ERD" src="https://github.com/user-attachments/assets/bdcec08a-8855-4b1a-8ca1-5630e8db3dfc" />
   <!-- SCREENSHOT_PLACEHOLDER: optionally add more app screenshots here (blueprint ERD, generated DDL, dbt scaffold, Telemetry tab) — this comment is invisible to readers -->
 </div>
@@ -31,7 +30,6 @@
 - [Honest Limitations](#honest-limitations)
 - [Design Principles](#design-principles)
 - [License](#license)
-
 
 <a id="demo"></a>
 ## 🎥 Demo
@@ -143,9 +141,9 @@ star-schema-generator/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                  # GitHub Actions CI pipeline (pytest + coverage)
+├── pyproject.toml                  # Package metadata + pytest/coverage configuration
 ├── requirements.txt                # Python dependencies: Streamlit, google-genai, Pydantic v2, DuckDB, Rich
 ├── requirements-dev.txt            # Dev dependencies: pytest, pytest-cov
-├── pytest.ini                      # Pytest configuration
 ├── README.md                       # This file
 ├── tests/                          # Comprehensive test suite for core business logic
 │   ├── test_duckdb_runner.py
@@ -195,11 +193,15 @@ Deploys directly to Streamlit Community Cloud (free tier) as a hosted app — se
 This project maintains a comprehensive `pytest` suite to validate Pydantic schema contracts, DuckDB execution rules, and LLM error-handling paths. The suite achieves ~90% coverage on core business logic (`schemas.py`, `duckdb_runner.py`, `llm_engine.py`) while intentionally avoiding brittle UI mocking in the Streamlit layer.
 
 ```bash
-# Install dev dependencies
+# Install dependencies
+pip install -r requirements.txt
 pip install -r requirements-dev.txt
 
-# Run the test suite with coverage
-pytest --cov=app -v
+# Install the project in editable mode so pytest can resolve the `app` package
+pip install -e .
+
+# Run the suite (coverage flags are preconfigured in pyproject.toml)
+pytest
 ```
 
 > **Note:** The GitHub Actions CI pipeline runs these tests automatically on every push to `main`. Because the GenAI client is fully mocked in the test suite, **no Gemini API key is required** for the CI to pass.
