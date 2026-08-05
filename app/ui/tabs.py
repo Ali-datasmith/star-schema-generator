@@ -12,7 +12,6 @@ import math
 from typing import Dict, List, Optional
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from app.schemas import StarSchemaResponse
 from app.services.duckdb_runner import DDLExecutionReport
@@ -22,7 +21,7 @@ from app.services.llm_engine import LLMCallResult
 def _copy_to_clipboard(text: str, key: str) -> None:
     """Renders a button that uses a JS bridge to write `text` to the clipboard."""
     if st.button("📋 Copy to Clipboard", key=key, help="Copy to clipboard"):
-        components.html(
+        st.iframe(
             f"""
             <script>
             (async () => {{
@@ -429,7 +428,7 @@ def render_erd_tab(schema_result: Optional[StarSchemaResponse]) -> None:
         .replace("__LABELS__", "".join(labels_html))
     )
 
-    components.html(rendered, height=int(h_canvas) + 2, scrolling=True)
+    st.iframe(rendered, height=int(h_canvas) + 2, scrolling=True)
 
     # ---- summary metrics (theme-styled, below the canvas) ----
     total_columns = len(fact.measures) + sum(len(d.attributes) for d in schema_result.dimensions)
