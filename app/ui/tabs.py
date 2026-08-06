@@ -428,7 +428,7 @@ def render_erd_tab(schema_result: Optional[StarSchemaResponse]) -> None:
         .replace("__LABELS__", "".join(labels_html))
     )
 
-    st.iframe(rendered, height=int(h_canvas) + 2, scrolling=True)
+    st.iframe(rendered, height=int(h_canvas) + 2)
 
     # ---- summary metrics (theme-styled, below the canvas) ----
     total_columns = len(fact.measures) + sum(len(d.attributes) for d in schema_result.dimensions)
